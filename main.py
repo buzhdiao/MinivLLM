@@ -1,78 +1,79 @@
-import sys, os
-from pathlib import Path
-import torch.distributed as dist
+import sys, os  # 导入系统模块 sys（用于修改 Python 路径）和操作系统模块 os（用于处理路径、环境变量）
+from pathlib import Path  # 导入 Path 类，用于以面向对象方式处理文件路径
+import torch.distributed as dist  # 导入 PyTorch 分布式通信模块（本脚本未直接使用，保持与分布式引擎的兼容）
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM  # 从 transformers 导入自动分词器与因果语言模型类（此处主要用于加载分词器）
+import torch  # 导入 PyTorch 主库
 
 # Add src to Python path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent / "src"))  # 将脚本所在目录下的 src 目录插入 sys.path 首位，使 myvllm 包可以被导入
 
-from myvllm.models.qwen3 import Qwen3ForCausalLM
-from myvllm.engine.llm_engine import LLMEngine as LLM
-from myvllm.sampling_parameters import SamplingParams
+from myvllm.models.qwen3 import Qwen3ForCausalLM  # 导入自实现的 Qwen3 因果语言模型（教学版 vLLM 中的模型定义）
+from myvllm.engine.llm_engine import LLMEngine as LLM  # 导入自实现的 LLM 推理引擎，并简写为 LLM（对标 vLLM 的 LLM 入口类）
+from myvllm.sampling_parameters import SamplingParams  # 导入采样参数类，用于控制生成时的温度、最大生成长度等
 
-config = {
-    'max_num_sequences': 16,
-    'max_num_batched_tokens': 1024,
-    'max_cached_blocks': 1024,
-    'block_size': 256,
-    'world_size': 1,
-    'model_name_or_path': 'Qwen/Qwen3-0.6B',
-    'enforce_eager': True,
-    'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
-    'hidden_size': 1024,
-    'num_heads': 16,
-    'head_dim': 128,  # Fixed: was 64, should be 128 (hidden_size / num_heads for GQA output)
-    'num_kv_heads': 8,
-    'intermediate_size': 3072,
-    'num_layers': 28,
-    'tie_word_embeddings': True,
-    'base': 1000000,  # Fixed: was 10000, HF uses rope_theta=1000000
-    'rms_norm_epsilon': 1e-6,
-    'qkv_bias': False,
-    'scale': 1,
-    'max_position': 32768, # should be >= max_model_length, max position index allowed in rotary embedding
-    'ffn_bias': False,  # Fixed: HF Qwen3 doesn't use MLP bias
-    'max_num_batch_tokens': 4096,
-    'max_model_length': 128,
-    'gpu_memory_utilization': 0.9,
-    'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
+config = {  # 定义引擎与模型的全局配置字典
+    'max_num_sequences': 16,  # 调度器同时处理的最大序列数
+    'max_num_batched_tokens': 1024,  # 每次批量调度中允许的最大 token 数
+    'max_cached_blocks': 1024,  # KV 缓存可使用的最大块数量
+    'block_size': 256,  # KV 缓存中每个块包含的 token 数（块大小）
+    'world_size': 1,  # 分布式并行进程数（1 表示单卡运行）
+    'model_name_or_path': 'Qwen/Qwen3-0.6B',  # 模型在 HuggingFace 上的名称或本地路径
+    'enforce_eager': True,  # 强制以 eager 模式运行（不使用 CUDA Graph）
+    'vocab_size': 151936,  # 词表大小  # Fixed: was 151643, HF model uses 151936
+    'hidden_size': 1024,  # 隐藏层维度
+    'num_heads': 16,  # 注意力的查询头数量
+    'head_dim': 128,  # 每个注意力头的维度  # Fixed: was 64, should be 128 (hidden_size / num_heads for GQA output)
+    'num_kv_heads': 8,  # 注意力的键值头数量（GQA：少于查询头数量）
+    'intermediate_size': 3072,  # FFN 前馈层的中间维度
+    'num_layers': 28,  # Transformer 层数
+    'tie_word_embeddings': True,  # 输入词嵌入与输出 lm_head 共享权重
+    'base': 1000000,  # RoPE 旋转位置编码的基数（rope_theta）  # Fixed: was 10000, HF uses rope_theta=1000000
+    'rms_norm_epsilon': 1e-6,  # RMSNorm 归一化的数值稳定常数 epsilon
+    'qkv_bias': False,  # QKV 投影是否使用偏置项
+    'scale': 1,  # 注意力缩放系数（1 表示使用默认的 1/sqrt(head_dim) 缩放）
+    'max_position': 32768, # 旋转位置编码允许的最大位置索引，应不小于最大模型长度 # should be >= max_model_length, max position index allowed in rotary embedding
+    'ffn_bias': False,  # FFN 层是否使用偏置项  # Fixed: HF Qwen3 doesn't use MLP bias
+    'max_num_batch_tokens': 4096,  # 单次前向计算允许批量处理的最大 token 数
+    'max_model_length': 128,  # 模型支持的最大总长度（提示词 + 生成内容）
+    'gpu_memory_utilization': 0.9,  # GPU 显存的目标利用率（0.9 表示预留 10% 余量）
+    'eos': 151645,  # 结束符（EOS）的 token id，用于判断生成结束  # Fixed: should match tokenizer.eos_token_id
 }
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    model_name = config.get('model_name_or_path', 'Qwen/Qwen3-0.6B')
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=path)
-    llm = LLM(config=config)
+    # 主函数：加载分词器与推理引擎，构造提示词并执行批量文本生成
+    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")  # 将 ~ 展开为用户主目录，得到模型缓存目录路径
+    model_name = config.get('model_name_or_path', 'Qwen/Qwen3-0.6B')  # 从配置中读取模型名称，若缺失则使用默认值
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=path)  # 从指定缓存目录加载与模型配套的分词器
+    llm = LLM(config=config)  # 用配置字典实例化自实现的 LLM 推理引擎
     
     # max_tokens is the max number of generated tokens
     # max_model_length is the max total length including prompt
     # both should be set in SamplingParams and help to determine when to stop generation
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
-    prompts = [
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)  # 设置采样参数：温度 0.6、最多生成 256 个 token、总长度上限 128
+    prompts = [  # 定义原始用户提示词列表
         "introduce yourself",# * 15,
         "list all prime numbers within 100",# * 15,
         "give me your opinion on the impact of artificial intelligence on society",# * 15,
     ] #* 30
-    prompts = [
+    prompts = [  # 用分词器的对话模板把每条原始提示包装成模型可读的聊天格式（不进行 tokenize，只得到文本）
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
+            [{"role": "user", "content": prompt}],  # 构造单轮 user 消息
+            tokenize=False,  # 只返回模板文本，不做分词
+            add_generation_prompt=True,  # 在末尾追加 assistant 开始标记，提示模型开始生成回答
         )
-        for prompt in prompts
+        for prompt in prompts  # 遍历原始提示词列表
     ]
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params)  # 调用推理引擎对全部提示词批量生成结果
 
     # outputs is a dict with 'text' and 'token_ids' keys
-    generated_texts = outputs['text']
+    generated_texts = outputs['text']  # 从结果字典中取出生成的文本列表
 
-    for prompt, output in zip(prompts, generated_texts):
-        print("\n")
-        print(f"Prompt: {prompt}")
-        print(f"Completion: {output}")
+    for prompt, output in zip(prompts, generated_texts):  # 逐条遍历（提示词, 生成文本）配对
+        print("\n")  # 打印空行分隔各条结果
+        print(f"Prompt: {prompt}")  # 打印模板化后的提示词
+        print(f"Completion: {output}")  # 打印模型生成的补全内容
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # 仅当脚本被直接运行（而非被导入）时才执行主函数
+    main()  # 调用主函数启动推理流程
